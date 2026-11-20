@@ -12,17 +12,20 @@ bb plugin install 'git:https://github.com/strativd/bb-plugin-remote-file-links.g
 
 ## Use in BB
 
-Open a file in BB’s file panel. In the command palette (`⌘⇧P` on macOS),
-search for **Copy GitHub**. Choose a permalink, a link to the current branch,
-or a link to the default branch.
+Open a file from a registered BB workspace or project checkout. In the command
+palette (`⌘⇧P` on macOS), search for **Copy GitHub**. Choose a permalink, a link
+to the current branch, or a link to the default branch.
 
 The permalink shortcut is `⌘⌥⇧L` on macOS or `Ctrl+Alt+Shift+L` on Linux
 and Windows. Change it in **Settings → Keyboard**.
 
-The plugin uses local Git remote-tracking refs for `github.com`. A permalink
-requires a matching published file version. Fetch the relevant branches if
-an expected link is missing. Recipients need repository access for private
-links.
+The resolver works offline and uses local Git tracking refs for `github.com`.
+It requires a matching branch and remote in Git's `FETCH_HEAD` record. If
+Git lacks that record, for example after a fresh clone or after a fetch from
+another remote, run `git fetch <remote>` in the repository to refresh it.
+A permalink also requires a matching file version. Links to private
+repositories can reveal the repository and file names to anyone you share
+them with. Opening the file on GitHub requires repository access.
 
 ## CLI
 

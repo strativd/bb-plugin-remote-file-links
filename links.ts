@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { devNull } from "node:os";
 import {
   basename,
   dirname,
@@ -20,49 +22,36 @@ type Links = {
   default: Link | null;
 };
 type RemoteBranch = { remote: string; branch: string };
-type RemoteRef = RemoteBranch & { commit: string; blob: string };
+type RemoteRef = RemoteBranch & { repoUrl: string; commit: string; blob: string };
 
 const empty: Links = { permalink: null, current: null, default: null };
+const maxFetchHeadSize = 1024 * 1024;
 
-async function git(cwd: string, ...args: string[]): Promise<string> {
+async function readFetchHead(path: string): Promise<string> {
   try {
-    const { stdout } = await exec(
-      "git",
-      ["--no-optional-locks", "-C", cwd, ...args],
-      {
-        timeout: 4500,
-        maxBuffer: 128 * 1024,
-        windowsHide: true,
-        env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
-      },
+    if (!(await lstat(path)).isFile()) return "";
+    const file = await open(
+      path,
+      constants.O_RDONLY |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0),
     );
-    return stdout.trimEnd();
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size > maxFetchHeadSize) return "";
+      const bytes = Buffer.alloc(stat.size + 1);
+      const { bytesRead } = await file.read(bytes);
+      return bytesRead === stat.size ? bytes.toString("utf8", 0, bytesRead) : "";
+    } finally {
+      await file.close();
+    }
   } catch {
     return "";
   }
 }
 
-async function blobSha256(repo: string, blob: string): Promise<string | null> {
-  try {
-    const { stdout } = await exec(
-      "git",
-      ["--no-optional-locks", "-C", repo, "cat-file", "blob", blob],
-      {
-        encoding: "buffer",
-        timeout: 4500,
-        maxBuffer: 8 * 1024 * 1024,
-        windowsHide: true,
-        env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
-      },
-    );
-    return createHash("sha256").update(stdout).digest("hex");
-  } catch {
-    return null;
-  }
-}
-
 function githubRepo(remote: string): string | null {
-  const ssh = /^git@github\.com:(.*)$/i.exec(remote);
+  const ssh = /^(?:git@)?github\.com:(.*)$/i.exec(remote);
   let path = ssh?.[1];
   if (path === undefined) {
     try {
@@ -80,7 +69,7 @@ function githubRepo(remote: string): string | null {
       return null;
     }
   }
-  path = path.replace(/\.git$|\/$/g, "");
+  path = path.replace(/\/$/, "").replace(/\.git$/, "");
   return /^[\w.-]+\/[\w.-]+$/.test(path) &&
     !path.split("/").some((part) => part === "." || part === "..")
     ? `https://github.com/${path}`
@@ -91,47 +80,132 @@ function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-export async function resolveLinks({
-  path,
-  root,
-  ref,
-  location,
-  contentSha256,
-}: {
-  path: string;
-  root?: string;
-  ref?: string;
-  location: ExperimentalFileLocation | null;
-  contentSha256?: string | null;
-}): Promise<Links> {
+function isInside(root: string, path: string): boolean {
+  const fromRoot = relative(root, path);
+  return (
+    !isAbsolute(fromRoot) &&
+    fromRoot !== ".." &&
+    !fromRoot.startsWith(`..${sep}`)
+  );
+}
+
+function isLocalAbsolute(path: string): boolean {
+  return isAbsolute(path) && (sep !== "\\" || /^[a-z]:[/\\]/i.test(path));
+}
+
+export async function resolveLinks(
+  {
+    path,
+    root,
+    ref,
+    location,
+    contentSha256,
+  }: {
+    path: string;
+    root: string;
+    ref?: string;
+    location: ExperimentalFileLocation | null;
+    contentSha256?: string | null;
+  },
+  signal?: AbortSignal,
+): Promise<Links> {
   if (
-    (!root && !isAbsolute(path)) ||
-    (root && (isAbsolute(path) || path.split(/[/\\]/).includes("..")))
+    !isLocalAbsolute(root) ||
+    /^(?:[/\\]|[a-z]:)/i.test(path) ||
+    path.split(/[/\\]/).includes("..") ||
+    (sep === "\\" && path.includes(":"))
   ) {
     return empty;
   }
-  const file = resolve(root ?? "", path);
-  const parent = await realpath(dirname(file)).catch(() => null);
-  if (!parent) return empty;
-  if (root) {
-    const scope = await realpath(root).catch(() => null);
-    if (!scope) return empty;
-    const fromScope = relative(scope, parent);
-    if (
-      isAbsolute(fromScope) ||
-      fromScope === ".." ||
-      fromScope.startsWith(`..${sep}`)
-    )
-      return empty;
+  signal?.throwIfAborted();
+  const scope = await realpath(root).catch(() => null);
+  if (!scope || !isLocalAbsolute(scope)) return empty;
+  const file = resolve(scope, path);
+  const parentPath = dirname(file);
+  if (!isInside(scope, parentPath)) return empty;
+  if (sep === "\\" && parentPath !== scope) {
+    let folder = scope;
+    for (const segment of relative(scope, parentPath).split(sep)) {
+      folder = resolve(folder, segment);
+      const stat = await lstat(folder).catch(() => null);
+      if (!stat?.isDirectory() || stat.isSymbolicLink()) return empty;
+    }
   }
+  const parent = await realpath(parentPath).catch(() => null);
+  if (!parent || !isInside(scope, parent)) return empty;
+
+  const env = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !/^git_/i.test(name)),
+    ),
+    GIT_ALLOW_PROTOCOL: "",
+    GIT_GRAFT_FILE: devNull,
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_TRACE: "0",
+    GIT_TRACE2: "0",
+    GIT_TRACE2_EVENT: "0",
+    GIT_TRACE2_PERF: "0",
+  };
+  const gitArgs = (cwd: string, args: string[]) => [
+    "--no-pager",
+    "--no-optional-locks",
+    "--no-replace-objects",
+    "-C",
+    cwd,
+    ...args,
+  ];
+  async function git(cwd: string, ...args: string[]): Promise<string> {
+    signal?.throwIfAborted();
+    try {
+      const { stdout } = await exec("git", gitArgs(cwd, args), {
+        env,
+        signal,
+        timeout: 4500,
+        maxBuffer: 128 * 1024,
+        windowsHide: true,
+      });
+      return stdout.trimEnd();
+    } catch {
+      signal?.throwIfAborted();
+      return "";
+    }
+  }
+
   const repo = await git(parent, "rev-parse", "--show-toplevel");
-  if (!repo) return empty;
+  if (!isLocalAbsolute(repo)) return empty;
   const canonicalRepo = await realpath(repo).catch(() => null);
-  if (!canonicalRepo) return empty;
+  if (!canonicalRepo || !isInside(scope, canonicalRepo)) return empty;
   const localPath = resolve(parent, basename(file));
-  const filename = relative(canonicalRepo, localPath).split(sep).join("/");
-  if (!filename || filename === ".." || filename.startsWith("../"))
+  if (localPath === canonicalRepo || !isInside(canonicalRepo, localPath))
     return empty;
+  const filename = relative(canonicalRepo, localPath).split(sep).join("/");
+
+  const [fetchHeadPath, commonDir] = await Promise.all([
+    git(repo, "rev-parse", "--git-path", "FETCH_HEAD"),
+    git(repo, "rev-parse", "--git-common-dir"),
+  ]);
+  // A linked worktree and the main checkout can have separate fetch records.
+  const fetchHeadPaths = new Set(
+    [fetchHeadPath, commonDir && resolve(repo, commonDir, "FETCH_HEAD")]
+      .filter(Boolean)
+      .map((path) => resolve(repo, path))
+      .filter(isLocalAbsolute),
+  );
+  const fetched = new Set<string>();
+  const fetchedKey = (repoUrl: string, branch: string, commit: string) =>
+    `${repoUrl.toLowerCase()}\t${branch}\t${commit}`;
+  for (const log of await Promise.all([...fetchHeadPaths].map(readFetchHead))) {
+    for (const line of log.split("\n").slice(0, -1)) {
+      const entry = /^([a-f0-9]{40}|[a-f0-9]{64})\t(?:not-for-merge)?\tbranch '(.+)' of (.+)$/.exec(
+        line,
+      );
+      if (!entry) continue;
+      const [, commit, branch, url] = entry;
+      const repoUrl = githubRepo(url);
+      if (repoUrl) fetched.add(fetchedKey(repoUrl, branch, commit));
+    }
+  }
+  if (fetched.size === 0) return empty;
 
   const [remoteOutput, branchRef, desiredCommit] = await Promise.all([
     git(repo, "remote"),
@@ -154,6 +228,16 @@ export async function resolveLinks({
     ? await git(repo, "for-each-ref", "--format=%(upstream)", branchRef)
     : "";
 
+  const remoteUrls = new Map<string, Promise<string | null>>();
+  function remoteUrl(remote: string): Promise<string | null> {
+    let url = remoteUrls.get(remote);
+    if (!url) {
+      url = git(repo, "remote", "get-url", "--", remote).then(githubRepo);
+      remoteUrls.set(remote, url);
+    }
+    return url;
+  }
+
   function remoteBranch(candidate: string): RemoteBranch | null {
     const remote = remoteNames.find((name) =>
       candidate.startsWith(`refs/remotes/${name}/`),
@@ -163,9 +247,18 @@ export async function resolveLinks({
     return branch && branch !== "HEAD" ? { remote, branch } : null;
   }
 
-  async function readRemoteRef(candidate: string): Promise<RemoteRef | null> {
+  async function publishedBranch(candidate: string, commit: string) {
     const target = remoteBranch(candidate);
     if (!target) return null;
+    const repoUrl = await remoteUrl(target.remote);
+    // Git keeps tracking refs when a remote URL changes.
+    return repoUrl && fetched.has(fetchedKey(repoUrl, target.branch, commit))
+      ? { ...target, repoUrl }
+      : null;
+  }
+
+  async function readRemoteRef(candidate: string): Promise<RemoteRef | null> {
+    if (!remoteBranch(candidate)) return null;
     const commit = await git(
       repo,
       "rev-parse",
@@ -173,6 +266,8 @@ export async function resolveLinks({
       `${candidate}^{commit}`,
     );
     if (!commit) return null;
+    const target = await publishedBranch(candidate, commit);
+    if (!target) return null;
     const blob = await git(
       repo,
       "rev-parse",
@@ -208,24 +303,42 @@ export async function resolveLinks({
           .catch(() => ""),
   ]);
 
+  async function blobSha256(blob: string): Promise<string | null> {
+    signal?.throwIfAborted();
+    try {
+      const { stdout } = await exec(
+        "git",
+        gitArgs(repo, ["cat-file", "blob", blob]),
+        {
+          encoding: "buffer",
+          env,
+          signal,
+          timeout: 4500,
+          maxBuffer: 8 * 1024 * 1024,
+          windowsHide: true,
+        },
+      );
+      return createHash("sha256").update(stdout).digest("hex");
+    } catch {
+      signal?.throwIfAborted();
+      return null;
+    }
+  }
+
   const canLinkViewedLines =
     location === null ||
     contentSha256 === undefined ||
     (contentSha256 !== null &&
       Boolean(viewedBlob) &&
-      contentSha256 === (await blobSha256(repo, viewedBlob)));
+      contentSha256 === (await blobSha256(viewedBlob)));
 
-  async function makeLink(
-    target: RemoteBranch,
+  function makeLink(
+    target: RemoteBranch & { repoUrl: string },
     revision: string,
     blob: string,
-  ): Promise<Link | null> {
-    const repoUrl = githubRepo(
-      await git(repo, "remote", "get-url", "--", target.remote),
-    );
-    if (!repoUrl) return null;
+  ): Link {
     const exact = canLinkViewedLines && blob === viewedBlob;
-    let url = `${repoUrl}/blob/${encodePath(revision)}/${encodePath(filename)}`;
+    let url = `${target.repoUrl}/blob/${encodePath(revision)}/${encodePath(filename)}`;
     if (location && exact) {
       if (/\.(?:md|markdown)$/i.test(filename)) url += "?plain=1";
       url +=
@@ -240,33 +353,35 @@ export async function resolveLinks({
     };
   }
 
-  const [currentLink, defaultLink] = await Promise.all([
-    current ? makeLink(current, current.branch, current.blob) : null,
-    defaultRef
-      ? makeLink(defaultRef, defaultRef.branch, defaultRef.blob)
-      : null,
-  ]);
-  let permalink = null;
+  const currentLink = current
+    ? makeLink(current, current.branch, current.blob)
+    : null;
+  const defaultLink = defaultRef
+    ? makeLink(defaultRef, defaultRef.branch, defaultRef.blob)
+    : null;
+  let permalink: Link | null = null;
   if (viewedBlob && canLinkViewedLines) {
     if (desiredCommit) {
       const publishedRefs = await git(
         repo,
         "for-each-ref",
         `--contains=${desiredCommit}`,
-        "--format=%(refname)",
+        "--format=%(refname)%09%(objectname)",
         "refs/remotes",
       );
-      for (const ref of publishedRefs.split("\n")) {
-        const candidate = remoteBranch(ref);
+      for (const line of publishedRefs.split("\n")) {
+        const [name, commit] = line.split("\t");
+        if (!commit) continue;
+        const candidate = await publishedBranch(name, commit);
         if (!candidate) continue;
-        permalink = await makeLink(candidate, desiredCommit, viewedBlob);
-        if (permalink) break;
+        permalink = makeLink(candidate, desiredCommit, viewedBlob);
+        break;
       }
     } else {
       for (const candidate of [current, defaultRef]) {
         if (!candidate || candidate.blob !== viewedBlob) continue;
-        permalink = await makeLink(candidate, candidate.commit, viewedBlob);
-        if (permalink) break;
+        permalink = makeLink(candidate, candidate.commit, viewedBlob);
+        break;
       }
     }
   }

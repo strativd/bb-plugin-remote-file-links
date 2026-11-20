@@ -2,11 +2,16 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 const id = z.string().min(1).max(128);
-export const filePath = z
+const filePath = z
   .string()
   .min(1)
   .max(4096)
   .regex(/^[^\u0000\r\n]+$/);
+const workspacePath = filePath.refine(
+  (path) =>
+    !/^(?:[/\\]|[a-z]:)/i.test(path) &&
+    !path.split(/[/\\]/).includes(".."),
+);
 const ref = z.string().regex(/^(HEAD|[a-f0-9]{4,64})$/i);
 const contentSha256 = z
   .string()
@@ -29,10 +34,15 @@ export const fileInput = z.object({
     z.object({
       kind: z.literal("workspace"),
       environmentId: id,
-      path: filePath,
+      path: workspacePath,
       experimental_ref: ref.optional(),
     }),
-    z.object({ kind: z.literal("host"), hostId: id, path: filePath }),
+    z.object({
+      kind: z.literal("project"),
+      projectId: id.optional(),
+      hostId: id,
+      path: filePath,
+    }),
   ]),
   location: location.nullable(),
   contentSha256,
@@ -56,14 +66,13 @@ export const fileLinkRpc = defineRpcContract({
 export const fileLinkHostRpc = defineRpcContract({
   resolve: {
     input: z.object({
-      path: filePath,
-      root: filePath.optional(),
+      path: workspacePath,
+      root: filePath,
       ref: ref.optional(),
       location: location.nullable(),
       contentSha256,
     }),
     output: links,
-    experimental_retryable: true,
   },
 });
 

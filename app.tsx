@@ -1,8 +1,9 @@
-import { useState, useEffect, type ComponentType } from "react";
+import type { ComponentType } from "react";
 import { toast } from "sonner";
 import {
   definePluginApp,
   experimental_copyToClipboard,
+  useBbContext,
   useRpc,
   type PluginCommandContext,
 } from "@get-bb/plugin-sdk/app";
@@ -23,6 +24,30 @@ const choices = [
   ["current", "Copy GitHub link on current branch"],
   ["default", "Copy GitHub link on default branch"],
 ] as const;
+
+const hostPreviewInput = fileInput.extend({
+  target: z.object({
+    kind: z.literal("host"),
+    hostId: z.string(),
+    path: z.string(),
+  }),
+});
+
+function panelInput(input: unknown, projectId: string | null): FileInput | null {
+  const parsed = fileInput.safeParse(input);
+  if (parsed.success) return parsed.data;
+  const preview = hostPreviewInput.safeParse(input);
+  if (!preview.success) return null;
+  const scoped = fileInput.safeParse({
+    ...preview.data,
+    target: {
+      ...preview.data.target,
+      kind: "project",
+      projectId: projectId ?? undefined,
+    },
+  });
+  return scoped.success ? scoped.data : null;
+}
 
 async function copyLink(links: Links, kind: LinkKind) {
   const link = links[kind];
@@ -47,64 +72,38 @@ async function copyLink(links: Links, kind: LinkKind) {
 
 function FileMenu({ target, location, contentSha256, Item }: MenuProps) {
   const rpc = useRpc<typeof fileLinkRpc>();
-  const input = JSON.stringify({ target, location, contentSha256 });
-  const [result, setResult] = useState<{
-    input: string;
-    links: Links | null;
-  } | null>(null);
-  useEffect(() => {
-    const parsed = fileInput.safeParse(JSON.parse(input));
-    if (!parsed.success) return;
-    let active = true;
-    void rpc.call("resolve", parsed.data).then(
-      (links) => {
-        if (active) setResult({ input, links });
-      },
-      () => {
-        if (active) setResult({ input, links: null });
-      },
-    );
-    return () => {
-      active = false;
-    };
-  }, [input, rpc]);
-
-  const links = result?.input === input ? result.links : null;
-  return links
-    ? choices.map(([kind, label]) => {
-        const link = links[kind];
-        return link ? (
-          <Item
-            key={kind}
-            label={kind === "permalink" ? label : `${label} (${link.branch})`}
-            onSelect={() => {
-              void copyLink(links, kind);
-            }}
-          />
-        ) : null;
-      })
-    : null;
+  const { projectId } = useBbContext();
+  const input = panelInput({ target, location, contentSha256 }, projectId);
+  if (!input) return null;
+  return choices.map(([kind, label]) => (
+    <Item
+      key={kind}
+      label={label}
+      onSelect={() => {
+        void rpc.call("resolve", input)
+          .then((links) => copyLink(links, kind))
+          .catch(() => toast.error("Could not resolve the GitHub link"));
+      }}
+    />
+  ));
 }
 
 function activeFile({
+  projectId,
   experimental_panel,
   experimental_getActiveFile,
 }: PluginCommandContext & {
   experimental_getActiveFile?: () => unknown;
 }): FileInput | null {
   const viewerFile = experimental_getActiveFile?.();
-  if (viewerFile) {
-    const parsed = fileInput.safeParse(viewerFile);
-    return parsed.success ? parsed.data : null;
-  }
+  if (viewerFile) return panelInput(viewerFile, projectId);
   const panel = experimental_panel.getTabs();
   const tab = panel.open
     ? panel.tabs.find((entry) => entry.key === panel.selectedKey)
     : undefined;
   if (!tab) return null;
   if ("experimental_fileAction" in tab.detail) {
-    const parsed = fileInput.safeParse(tab.detail.experimental_fileAction);
-    return parsed.success ? parsed.data : null;
+    return panelInput(tab.detail.experimental_fileAction, projectId);
   }
   if (
     tab.detail.kind === "plugin" &&
@@ -113,34 +112,20 @@ function activeFile({
     const parsed = z
       .object({
         path: z.string(),
-        source: z.object({
-          kind: z.string(),
-          environmentId: z.string().nullable(),
-          experimental_hostId: z.string().optional(),
-        }),
+        source: z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("workspace"), environmentId: z.string() }),
+          z.object({ kind: z.literal("host"), experimental_hostId: z.string() }),
+        ]),
       })
       .safeParse(tab.detail.params);
     if (!parsed.success) return null;
     const { path, source } = parsed.data;
-    if (source.kind === "workspace" && source.environmentId) {
-      return {
-        target: {
-          kind: "workspace",
-          environmentId: source.environmentId,
-          path,
-        },
-        location: null,
-      };
-    }
-    if (source.kind === "host" && source.experimental_hostId) {
-      return {
-        target: { kind: "host", hostId: source.experimental_hostId, path },
-        location: null,
-      };
-    }
-    return null;
+    const target = source.kind === "workspace"
+      ? { kind: "workspace", environmentId: source.environmentId, path }
+      : { kind: "host", hostId: source.experimental_hostId, path };
+    return panelInput({ target, location: null }, projectId);
   }
-  if (tab.detail.kind !== "file") return null;
+  if (tab.detail.kind !== "file" || tab.status !== null) return null;
   const match = /^(workspace|host)-file-preview:[^:]+:([^:]+)$/.exec(tab.key);
   if (!match) return null;
   let scope: string;
@@ -149,20 +134,20 @@ function activeFile({
   } catch {
     return null;
   }
-  const hostId =
-    match[1] === "host" && scope.startsWith("host:") ? scope.slice(5) : null;
-  const environmentId =
-    match[1] === "workspace" && scope.startsWith("env_") ? scope : null;
-  if (hostId)
-    return {
-      target: { kind: "host", hostId, path: tab.detail.path },
-      location: null,
-    };
-  if (!environmentId || tab.status !== null) return null;
-  return {
-    target: { kind: "workspace", environmentId, path: tab.detail.path },
-    location: null,
-  };
+  const path = tab.detail.path;
+  if (match[1] === "workspace" && scope.startsWith("env_")) {
+    return panelInput(
+      { target: { kind: "workspace", environmentId: scope, path }, location: null },
+      projectId,
+    );
+  }
+  if (match[1] === "host" && scope.startsWith("host:")) {
+    return panelInput(
+      { target: { kind: "host", hostId: scope.slice(5), path }, location: null },
+      projectId,
+    );
+  }
+  return null;
 }
 
 async function resolveFromCommand(input: FileInput): Promise<Links> {

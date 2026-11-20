@@ -4,5 +4,5 @@ import { resolveLinks } from "./links.js";
 
 export default experimental_defineHostEntry({
   contract: fileLinkHostRpc,
-  handlers: { resolve: resolveLinks },
+  handlers: { resolve: (input, { signal }) => resolveLinks(input, signal) },
 });

@@ -3,11 +3,11 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import { resolveLinks } from "./links.ts";
 
-test("uses the nested repo and only links lines in matching published blobs", async () => {
+test("uses fetched refs for a nested workspace repository and matches line links", async () => {
   const root = mkdtempSync(join(tmpdir(), "bb-remote-file-links-"));
   try {
     const repo = join(root, "src", "nested");
@@ -18,8 +18,13 @@ test("uses the nested repo and only links lines in matching published blobs", as
     git(repo, "init", "-q", "-b", "main");
     git(repo, "config", "user.name", "Test");
     git(repo, "config", "user.email", "test@example.invalid");
+    git(repo, "config", "commit.gpgSign", "false");
     const name = "notes #1.md";
     const path = join(repo, name);
+    const resolveFile = (
+      input: Omit<Parameters<typeof resolveLinks>[0], "root" | "path">,
+    ) => resolveLinks({ root, path: relative(root, path), ...input });
+    const noLinks = { permalink: null, current: null, default: null };
     writeFileSync(path, "first\nsecond\nthird\n");
     git(repo, "add", "--", name);
     git(repo, "commit", "-qm", "main");
@@ -38,7 +43,12 @@ test("uses the nested repo and only links lines in matching published blobs", as
     const head = git(repo, "rev-parse", "HEAD");
     const location = { kind: "range" as const, startLine: 2, endLine: 3 };
     const base = "https://github.com/example/nested/blob";
-    const unpublished = await resolveLinks({ path, location });
+    const fetchHead = join(repo, ".git", "FETCH_HEAD");
+    const fetched = (commit: string, branch: string) =>
+      `${commit}\tnot-for-merge\tbranch '${branch}' of github.com:example/nested\n`;
+    assert.deepEqual(await resolveFile({ location }), noLinks);
+    writeFileSync(fetchHead, fetched(main, "main"));
+    const unpublished = await resolveFile({ location });
     assert.equal(unpublished.permalink, null);
     assert.equal(unpublished.current, null);
     assert.deepEqual(unpublished.default, {
@@ -49,7 +59,11 @@ test("uses the nested repo and only links lines in matching published blobs", as
 
     git(repo, "update-ref", "refs/remotes/origin/feature/file-links", "HEAD");
     git(repo, "branch", "--set-upstream-to=origin/feature/file-links");
-    const published = await resolveLinks({ path, location });
+    writeFileSync(
+      fetchHead,
+      fetched(main, "main") + fetched(head, "feature/file-links"),
+    );
+    const published = await resolveFile({ location });
     assert.equal(
       published.permalink?.url,
       `${base}/${head}/notes%20%231.md?plain=1#L2-L3`,
@@ -60,30 +74,49 @@ test("uses the nested repo and only links lines in matching published blobs", as
     );
     assert.equal(published.default?.omittedLocation, true);
 
+    const worktree = join(root, "linked");
+    git(repo, "worktree", "add", "--quiet", "--detach", worktree, head);
+    const linked = await resolveLinks({
+      root: worktree,
+      path: name,
+      location,
+      ref: head,
+    });
+    assert.deepEqual(linked.permalink, published.permalink);
+
+    git(
+      repo, "remote", "set-url", "origin", "https://github.com/example/another.git",
+    );
+    assert.deepEqual(await resolveFile({ location, ref: head }), noLinks);
+    git(
+      repo, "remote", "set-url", "origin", "https://github.com/example/nested.git",
+    );
+    assert.deepEqual(await resolveFile({ location }), published);
+
     const displayed = createHash("sha256")
       .update("intro\nfirst\nsecond\nthird\n")
       .digest("hex");
     for (const contentSha256 of [null, "0".repeat(64)]) {
-      const unsafe = await resolveLinks({ path, location, contentSha256 });
+      const unsafe = await resolveFile({ location, contentSha256 });
       assert.equal(unsafe.permalink, null);
       assert.equal(unsafe.current?.omittedLocation, true);
       assert.equal(unsafe.default?.omittedLocation, true);
     }
     assert.deepEqual(
-      await resolveLinks({ path, location, contentSha256: displayed }),
+      await resolveFile({ location, contentSha256: displayed }),
       published,
     );
 
-    const snapshot = await resolveLinks({ path, location, ref: main });
+    const snapshot = await resolveFile({ location, ref: main });
     assert.equal(
       snapshot.permalink?.url,
       `${base}/${main}/notes%20%231.md?plain=1#L2-L3`,
     );
 
     writeFileSync(path, "dirty\n");
-    assert.equal((await resolveLinks({ path, location })).permalink, null);
+    assert.equal((await resolveFile({ location })).permalink, null);
     assert.equal(
-      (await resolveLinks({ path, location })).current?.omittedLocation,
+      (await resolveFile({ location })).current?.omittedLocation,
       true,
     );
 
@@ -92,7 +125,8 @@ test("uses the nested repo and only links lines in matching published blobs", as
     git(repo, "rm", "--", name);
     git(repo, "commit", "-qm", "remove file from default branch");
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD");
-    const removed = await resolveLinks({ path, location, ref: main });
+    writeFileSync(fetchHead, fetched(git(repo, "rev-parse", "HEAD"), "main"));
+    const removed = await resolveFile({ location, ref: main });
     assert.equal(removed.default, null);
     assert.equal(removed.current, null);
     assert.equal(
@@ -102,11 +136,10 @@ test("uses the nested repo and only links lines in matching published blobs", as
 
     const local = join(root, "local.md");
     writeFileSync(local, "local");
-    assert.deepEqual(await resolveLinks({ path: local, location: null }), {
-      permalink: null,
-      current: null,
-      default: null,
-    });
+    assert.deepEqual(
+      await resolveLinks({ root, path: relative(root, local), location: null }),
+      noLinks,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
