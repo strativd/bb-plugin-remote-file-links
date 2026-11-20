@@ -1,0 +1,45 @@
+{
+  "name": "bb-plugin-remote-file-links",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.50.1",
+    "bbPluginSdk": ">=0.6.157"
+  },
+  "bb": {
+    "name": "Remote File Links",
+    "description": "Copy GitHub links to files opened in BB.",
+    "branding": {
+      "icon": "GitBranch"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "host": "./host.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.6.157",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "hono": "^4.13.19",
+    "sonner": "^1.7.4",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "test": "node --test links.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "description": "Copy GitHub links to files opened in BB.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strativd/bb-plugin-remote-file-links.git"
+  }
+}
