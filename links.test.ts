@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { symlinkSync } from "node:fs";
 import { test } from "node:test";
 import { resolveLinks } from "./links.ts";
 
@@ -97,10 +98,12 @@ test("uses fetched refs for a nested workspace repository and matches line links
       .update("intro\nfirst\nsecond\nthird\n")
       .digest("hex");
     for (const contentSha256 of [null, "0".repeat(64)]) {
-      const unsafe = await resolveFile({ location, contentSha256 });
-      assert.equal(unsafe.permalink, null);
-      assert.equal(unsafe.current?.omittedLocation, true);
-      assert.equal(unsafe.default?.omittedLocation, true);
+      for (const unsafeLocation of [location, null]) {
+        const unsafe = await resolveFile({ location: unsafeLocation, contentSha256 });
+        assert.equal(unsafe.permalink, null);
+        if (unsafeLocation === location)
+          assert.equal(unsafe.current?.omittedLocation, true);
+      }
     }
     assert.deepEqual(
       await resolveFile({ location, contentSha256: displayed }),
@@ -140,6 +143,45 @@ test("uses fetched refs for a nested workspace repository and matches line links
       await resolveLinks({ root, path: relative(root, local), location: null }),
       noLinks,
     );
+
+    // A published repository outside the workspace stays unreachable.
+    const escape = join(root, "escape");
+    mkdirSync(escape);
+    git(escape, "init", "-q", "-b", "main");
+    git(escape, "config", "user.name", "Test");
+    git(escape, "config", "user.email", "test@example.invalid");
+    git(escape, "config", "commit.gpgSign", "false");
+    writeFileSync(join(escape, "secret.txt"), "secret\n");
+    git(escape, "add", "secret.txt");
+    git(escape, "commit", "-qm", "escape");
+    git(escape, "remote", "add", "origin", "https://github.com/example/secret.git");
+    git(escape, "update-ref", "refs/remotes/origin/main", "HEAD");
+    git(
+      escape,
+      "symbolic-ref",
+      "refs/remotes/origin/HEAD",
+      "refs/remotes/origin/main",
+    );
+    writeFileSync(
+      join(escape, ".git", "FETCH_HEAD"),
+      `${git(escape, "rev-parse", "HEAD")}\tnot-for-merge\tbranch 'main' of https://github.com/example/secret\n`,
+    );
+    const escapeSha = git(escape, "rev-parse", "HEAD");
+    symlinkSync(escape, join(repo, "leak"));
+    for (const path of [
+      "../escape/secret.txt",
+      join("leak", "secret.txt"),
+      "nested/../../escape/secret.txt",
+    ]) {
+      assert.deepEqual(
+        await resolveLinks({ root, path, location: null }),
+        noLinks,
+      );
+      assert.deepEqual(
+        await resolveLinks({ root, path, location: null, ref: escapeSha }),
+        noLinks,
+      );
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

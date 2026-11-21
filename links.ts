@@ -325,8 +325,8 @@ export async function resolveLinks(
     }
   }
 
-  const canLinkViewedLines =
-    location === null ||
+  // undefined: the caller sent no hash; null: the viewer could not hash the content.
+  const matchesViewer =
     contentSha256 === undefined ||
     (contentSha256 !== null &&
       Boolean(viewedBlob) &&
@@ -337,7 +337,7 @@ export async function resolveLinks(
     revision: string,
     blob: string,
   ): Link {
-    const exact = canLinkViewedLines && blob === viewedBlob;
+    const exact = matchesViewer && blob === viewedBlob;
     let url = `${target.repoUrl}/blob/${encodePath(revision)}/${encodePath(filename)}`;
     if (location && exact) {
       if (/\.(?:md|markdown)$/i.test(filename)) url += "?plain=1";
@@ -360,7 +360,7 @@ export async function resolveLinks(
     ? makeLink(defaultRef, defaultRef.branch, defaultRef.blob)
     : null;
   let permalink: Link | null = null;
-  if (viewedBlob && canLinkViewedLines) {
+  if (viewedBlob && matchesViewer) {
     if (desiredCommit) {
       const publishedRefs = await git(
         repo,
